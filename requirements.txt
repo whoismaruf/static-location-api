@@ -1,0 +1,6 @@
+Flask
+redis
+hiredis
+python-dotenv
+orjson
+gunicorn
