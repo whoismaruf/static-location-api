@@ -2,18 +2,14 @@ import os
 import json
 import orjson
 import redis
-from flask import Flask, Response
+from flask import Flask, Response, request
 
 app = Flask(__name__)
 
 # Redis configuration
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_DB = int(os.getenv("REDIS_DB", 0))
-
-# Initialize Redis Connection Pool
+# Initialize Redis Connection Pool natively hardcoded
 redis_pool = redis.ConnectionPool(
-    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
+    host="redis", port=6379, db=0, decode_responses=True
 )
 redis_client = redis.Redis(connection_pool=redis_pool)
 
@@ -21,16 +17,20 @@ redis_client = redis.Redis(connection_pool=redis_pool)
 def load_data_to_redis():
     """Load JSON data to Redis database dynamically at startup."""
     if os.path.exists("data.json"):
-        with open("data.json", "r") as f:
+        with open("data.json", "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        redis_client.delete("countries")
+        # Fast and clean flush to prevent orphan keys natively
+        redis_client.flushdb()
 
         for item in data:
             country_name = item.get("name")
             country_code = item.get("iso2")
             if not country_code or not country_name:
                 continue
+                
+            # Full structured country storage for the deep-dive endpoint
+            redis_client.set(f"country_raw:{country_code.upper()}", orjson.dumps(item))
 
             states_list = item.get("states") or []
             
@@ -46,17 +46,16 @@ def load_data_to_redis():
                 if not state_name:
                     continue
                     
-                # New data source lacks slugs, so we safely generate them dynamically
+                # New data source lacks slugs, safely generate dynamically
                 state_slug = state_obj.get("slug")
                 if not state_slug:
                     state_slug = state_name.lower().replace(" ", "-")
                 else:
                     state_slug = state_slug.lower()
                 
-                # Push a json object for the states list
                 state_data_list.append(orjson.dumps({"name": state_name, "slug": state_slug}))
                 
-                # New data source cities are objects {"name": "Ashkāsham", etc...} 
+                # Handle objects in cities arrays
                 cities_complex = state_obj.get("cities") or []
                 cities = []
                 for city_obj in cities_complex:
@@ -65,16 +64,13 @@ def load_data_to_redis():
                         
                 all_cities.extend(cities)
                 
-                redis_client.delete(f"cities:{country_code}:{state_slug}")
                 if cities:
                     redis_client.sadd(f"cities:{country_code}:{state_slug}", *cities)
+                    redis_client.sadd(f"cities_by_state:{state_slug}", *cities)
                 
-            redis_client.delete(f"states:{country_code}")
             if state_data_list:
                 redis_client.sadd(f"states:{country_code}", *state_data_list)
                 
-            # Maintain flat city list if desired
-            redis_client.delete(f"cities:{country_code}")
             if all_cities:
                 redis_client.sadd(f"cities:{country_code}", *all_cities)
 
@@ -98,22 +94,20 @@ def health_check():
 
 @app.route("/countries", methods=["GET"])
 def get_countries():
-    # smembers returns a set of JSON strings
     countries_raw = redis_client.smembers("countries")
-    # Parse them back into dicts to return them natively
     countries = [orjson.loads(c) for c in countries_raw]
     countries.sort(key=lambda x: x["country"])
     return json_response(countries)
 
 
-@app.route("/cities/<country_code>", defaults={'state_slug': None}, methods=["GET"])
-@app.route("/cities/<country_code>/<state_slug>", methods=["GET"])
-def get_cities(country_code, state_slug):
-    if state_slug:
-        cities = redis_client.smembers(f"cities:{country_code.upper()}:{state_slug.lower()}")
-    else:
-        cities = redis_client.smembers(f"cities:{country_code.upper()}")
-    return json_response(sorted(list(cities)))
+@app.route("/country/<country_code>", methods=["GET"])
+def get_country(country_code):
+    raw_data = redis_client.get(f"country_raw:{country_code.upper()}")
+    if not raw_data:
+        return json_response({"error": "Country not found"}, status=404)
+    # The JSON is already parsed natively by orjson upon cache initialization
+    return Response(raw_data, status=200, mimetype="application/json")
+
 
 @app.route("/states/<country_code>", methods=["GET"])
 def get_states(country_code):
@@ -121,6 +115,24 @@ def get_states(country_code):
     states = [orjson.loads(s) for s in states_raw]
     states.sort(key=lambda x: x["name"])
     return json_response(states)
+
+
+@app.route("/cities", methods=["GET"])
+def get_cities():
+    country = request.args.get("country")
+    state = request.args.get("state")
+    
+    cities = []
+    if country and state:
+        cities = redis_client.smembers(f"cities:{country.upper()}:{state.lower()}")
+    elif country:
+        cities = redis_client.smembers(f"cities:{country.upper()}")
+    elif state:
+        cities = redis_client.smembers(f"cities_by_state:{state.lower()}")
+    else:
+        return json_response({"error": "Missing params. Use ?country= or ?state="}, status=400)
+        
+    return json_response(sorted(list(cities)))
 
 
 if __name__ == "__main__":
